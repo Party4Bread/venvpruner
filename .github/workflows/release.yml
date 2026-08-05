@@ -50,13 +50,26 @@ jobs:
           set -euo pipefail
           bin="target/${{ matrix.target }}/release/venvpruner"
           test -x "$bin"
-          file "$bin"
+          desc=$(file "$bin")
+          echo "$desc"
           # A dynamically linked asset would fail on any host without a matching
           # libc, so make it a hard error rather than a warning.
-          if ! file "$bin" | grep -q "statically linked"; then
-            echo "::error::$bin is not statically linked"
-            exit 1
-          fi
+          #
+          # Test for the property that matters -- no dynamic loader -- rather
+          # than a spelling. `file` says "statically linked" for aarch64 but
+          # "static-pie linked" for x86_64, and matching only the former failed
+          # a perfectly good binary.
+          case "$desc" in
+            *"dynamically linked"*)
+              echo "::error::$bin is dynamically linked"
+              exit 1
+              ;;
+            *"statically linked"* | *"static-pie linked"*) ;;
+            *)
+              echo "::error::$bin has unexpected linkage: $desc"
+              exit 1
+              ;;
+          esac
           mkdir -p dist
           cp "$bin" "dist/venvpruner-${{ matrix.target }}"
 
