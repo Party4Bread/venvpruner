@@ -27,6 +27,9 @@ note() {
 }
 
 WORKDIR=""
+# shellcheck disable=SC2317,SC2329
+# Both warnings claim this function and its body are unreachable. They are
+# reached through the `trap` calls below, which shellcheck does not model.
 cleanup() {
     if [ "$KEEP" = 1 ]; then
         return 0

@@ -52,6 +52,8 @@ jobs:
       - name: Check run.sh
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          # SC2329: `cleanup` is invoked via trap, which shellcheck cannot see.
-          shellcheck -s sh -e SC2329 run.sh
+          shellcheck --version
+          # No -e exclusions: the one false positive is suppressed in-file, at
+          # the function it applies to, with a comment saying why.
+          shellcheck -s sh run.sh
           sh -n run.sh
