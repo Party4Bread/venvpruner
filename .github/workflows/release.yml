@@ -37,28 +37,60 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # cross builds inside a container that already carries the musl
-      # cross-linker, which matters for aarch64.
-      - name: Install cross
-        run: cargo install cross --locked --version 0.2.5
-
+      # The crate is pure Rust with no C dependencies, so `rust-lld` links the
+      # static musl binary for either architecture. No Docker and no `cross`.
       - name: Build
-        run: cross build --release --locked --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Stage artifact
+      - name: Stage and verify artifact
         run: |
           set -euo pipefail
           bin="target/${{ matrix.target }}/release/venvpruner"
           test -x "$bin"
-          # Statically linked: confirm it, so a release asset can never depend on
-          # a glibc the user does not have.
           file "$bin"
-          if ldd "$bin" 2>&1 | grep -qv 'not a dynamic executable'; then
-            echo "::warning::binary appears to be dynamically linked"
+          # A dynamically linked asset would fail on any host without a matching
+          # libc, so make it a hard error rather than a warning.
+          if ! file "$bin" | grep -q "statically linked"; then
+            echo "::error::$bin is not statically linked"
+            exit 1
           fi
           mkdir -p dist
           cp "$bin" "dist/venvpruner-${{ matrix.target }}"
-          strip "dist/venvpruner-${{ matrix.target }}" || true
+
+      # Actually run the binary before publishing it. aarch64 runs under qemu,
+      # which catches a build that links but cannot execute.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          bin="dist/venvpruner-${{ matrix.target }}"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq qemu-user
+            run="qemu-aarch64 $bin"
+          else
+            run="$bin"
+          fi
+          mkdir -p smoke/proj/.venv
+          printf 'home = /nonexistent\nversion_info = 3.12.0\n' > smoke/proj/.venv/pyvenv.cfg
+          touch smoke/proj/uv.lock
+          $run --version
+          $run --no-tui smoke
+          $run --json smoke > /dev/null
+          $run --dry-run smoke
+
+      - name: Strip
+        run: |
+          set -euo pipefail
+          # Strip only after the smoke test, so what ran is what ships.
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            sudo apt-get install -y -qq binutils-aarch64-linux-gnu
+            aarch64-linux-gnu-strip "dist/venvpruner-${{ matrix.target }}"
+          else
+            strip "dist/venvpruner-${{ matrix.target }}"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

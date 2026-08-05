@@ -2,7 +2,7 @@
 name = "venvpruner"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 description = "Find and prune venvs, node_modules, target dirs and caches, hardlink-aware"
 repository = "https://github.com/Party4Bread/venvpruner"
 readme = "README.md"
