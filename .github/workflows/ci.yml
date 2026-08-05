@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Build release
+        run: cargo build --release
+
+      # The tests build real directory trees, hardlinks and symlinks under
+      # $TMPDIR, so a runner whose /tmp is tmpfs still exercises the inode
+      # accounting. Nothing here touches anything outside the temp dir.
+      - name: Smoke test (read-only)
+        run: |
+          set -euo pipefail
+          mkdir -p smoke/proj/.venv
+          printf 'home = /nonexistent\nversion_info = 3.12.0\n' > smoke/proj/.venv/pyvenv.cfg
+          touch smoke/proj/pyproject.toml
+          ./target/release/venvpruner --no-tui smoke
+          ./target/release/venvpruner --json smoke > /dev/null
+          ./target/release/venvpruner --dry-run smoke
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check run.sh
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC2329: `cleanup` is invoked via trap, which shellcheck cannot see.
+          shellcheck -s sh -e SC2329 run.sh
+          sh -n run.sh

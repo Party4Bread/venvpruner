@@ -1,0 +1,105 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # cross builds inside a container that already carries the musl
+      # cross-linker, which matters for aarch64.
+      - name: Install cross
+        run: cargo install cross --locked --version 0.2.5
+
+      - name: Build
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/venvpruner"
+          test -x "$bin"
+          # Statically linked: confirm it, so a release asset can never depend on
+          # a glibc the user does not have.
+          file "$bin"
+          if ldd "$bin" 2>&1 | grep -qv 'not a dynamic executable'; then
+            echo "::warning::binary appears to be dynamically linked"
+          fi
+          mkdir -p dist
+          cp "$bin" "dist/venvpruner-${{ matrix.target }}"
+          strip "dist/venvpruner-${{ matrix.target }}" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: venvpruner-${{ matrix.target }}
+          path: dist/venvpruner-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: staging
+        run: |
+          set -euo pipefail
+          chmod 755 venvpruner-*
+          # Plain `sha256sum` text format: "<hash>  <name>". run.sh parses this.
+          sha256sum venvpruner-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes \
+            staging/venvpruner-* staging/SHA256SUMS \
+          || gh release upload "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            staging/venvpruner-* staging/SHA256SUMS
