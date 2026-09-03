@@ -155,6 +155,14 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     fs::symlink_metadata(path).ok()?.modified().ok()
 }
 
+/// Keep `md`'s mtime if it is the newest seen. Unreadable mtimes are dropped:
+/// there is nothing to compare, and a missing one must not read as "now".
+fn keep_newest_of(slot: &mut Option<SystemTime>, md: &fs::Metadata) {
+    if let Ok(t) = md.modified() {
+        keep_newest(slot, t);
+    }
+}
+
 fn keep_newest(slot: &mut Option<SystemTime>, t: SystemTime) {
     if slot.is_none_or(|cur| t > cur) {
         *slot = Some(t);
@@ -168,6 +176,23 @@ fn is_skipped_dir(name: &str, path: &Path) -> bool {
 
 /// Newest mtime under `project` at depth <= 2, plus the lock/manifest files
 /// sitting directly in it. The artifact itself and sibling artifacts are skipped.
+/// True when an entry's mtime counts as someone working on the project.
+///
+/// Both passes below ask exactly this, and asking it in one place is what keeps
+/// them from drifting apart. Symlinks are excluded because their mtime tracks
+/// the link, not the work; the artifact being judged, because it cannot be
+/// evidence for its own staleness; and other build output nearby, because a
+/// rebuild is not a human editing the project.
+fn counts_as_activity(path: &Path, name: &str, md: &fs::Metadata, artifact: &Path) -> bool {
+    if md.file_type().is_symlink() {
+        return false;
+    }
+    if !md.is_dir() {
+        return true;
+    }
+    path != artifact && !is_skipped_dir(name, path)
+}
+
 fn scan_project(project: &Path, artifact: &Path, signals: &mut Signals) {
     let Ok(entries) = fs::read_dir(project) else {
         return;
@@ -186,24 +211,18 @@ fn scan_project(project: &Path, artifact: &Path, signals: &mut Signals) {
 
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
+        // Every name is collected, symlinked and unreadable ones included: a
+        // lockfile still identifies what the artifact rebuilds from even when
+        // its mtime cannot be trusted.
         let Ok(md) = entry.metadata() else {
             names.push(name);
             continue;
         };
-
-        if md.file_type().is_symlink() {
-            names.push(name);
-            continue;
-        }
-        if md.is_dir() {
-            if path != artifact && !is_skipped_dir(&name, &path) {
-                if let Ok(t) = md.modified() {
-                    keep_newest(&mut newest, t);
-                }
+        if counts_as_activity(&path, &name, &md, artifact) {
+            keep_newest_of(&mut newest, &md);
+            if md.is_dir() {
                 subdirs.push(path);
             }
-        } else if let Ok(t) = md.modified() {
-            keep_newest(&mut newest, t);
         }
         names.push(name);
     }
@@ -222,18 +241,10 @@ fn scan_project(project: &Path, artifact: &Path, signals: &mut Signals) {
             budget -= 1;
 
             let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
             let Ok(md) = entry.metadata() else { continue };
-            if md.file_type().is_symlink() {
-                continue;
-            }
-            if md.is_dir() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if path == artifact || is_skipped_dir(&name, &path) {
-                    continue;
-                }
-            }
-            if let Ok(t) = md.modified() {
-                keep_newest(&mut newest, t);
+            if counts_as_activity(&path, &name, &md, artifact) {
+                keep_newest_of(&mut newest, &md);
             }
         }
     }

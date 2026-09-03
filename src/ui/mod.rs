@@ -305,35 +305,16 @@ impl App {
         loop {
             match rx.try_recv() {
                 Ok(DeleteMsg::Item { id, path, result }) => {
-                    self.del_done += 1;
-                    match result {
-                        Ok(outcome) => {
-                            // A partial removal freed real bytes and left a
-                            // real remainder: credit the one, report the other,
-                            // and keep the row so the leftovers stay visible.
-                            self.del_freed += outcome.freed;
-                            if let Some(why) = outcome.error {
-                                self.del_failures.push((path, why));
-                            }
-                            if outcome.complete {
-                                removed.push(id);
-                            } else {
-                                self.shrink_artifact(id, outcome.freed);
-                            }
-                        }
-                        Err(e) => self.del_failures.push((path, e)),
-                    }
+                    removed.extend(self.record_delete(id, path, result));
                     self.dirty = true;
                 }
-                Ok(DeleteMsg::Finished) => {
+                // A worker that hung up without saying `Finished` is still
+                // finished; there is nothing more to read either way.
+                Ok(DeleteMsg::Finished) | Err(TryRecvError::Disconnected) => {
                     finished = true;
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    finished = true;
-                    break;
-                }
             }
         }
 
@@ -350,6 +331,37 @@ impl App {
             self.mode = Mode::Results;
             self.dirty = true;
         }
+    }
+
+    /// Fold one worker result into the running totals. Returns the artifact's
+    /// id when nothing of it is left on disk, so the caller can drop the row.
+    fn record_delete(
+        &mut self,
+        id: ArtifactId,
+        path: PathBuf,
+        result: Result<crate::delete::Outcome, String>,
+    ) -> Option<ArtifactId> {
+        self.del_done += 1;
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(why) => {
+                self.del_failures.push((path, why));
+                return None;
+            }
+        };
+
+        // A partial removal freed real bytes and left a real remainder: credit
+        // the one, report the other, and keep the row so the leftovers stay
+        // visible.
+        self.del_freed += outcome.freed;
+        if let Some(why) = outcome.error {
+            self.del_failures.push((path, why));
+        }
+        if !outcome.complete {
+            self.shrink_artifact(id, outcome.freed);
+            return None;
+        }
+        Some(id)
     }
 
     /// A partly-deleted artifact stays in the list, so its row must stop
