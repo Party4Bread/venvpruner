@@ -282,6 +282,15 @@ fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
         let pycache: Arc<Mutex<HashMap<PathBuf, Vec<PathBuf>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
+        // Top-level cache directories found to contain artifacts, emitted after
+        // the walk as one `Cache` artifact each. The curated `cache_roots` list
+        // cannot cover this on its own: every tool that shells out to a package
+        // manager gets its own directory under the cache home, and the list
+        // would have to grow forever to keep up.
+        let cache_home = Arc::new(detect::cache_home());
+        let buckets: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+        let roots = Arc::new(cfg.roots.clone());
+
         if !cfg.roots.is_empty() && !ctx.stopped() {
             let mut builder = WalkBuilder::new(&cfg.roots[0]);
             for root in &cfg.roots[1..] {
@@ -306,6 +315,9 @@ fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
                 let ctx = Arc::clone(&ctx);
                 let skip = Arc::clone(&skip);
                 let pycache = Arc::clone(&pycache);
+                let cache_home = Arc::clone(&cache_home);
+                let buckets = Arc::clone(&buckets);
+                let roots = Arc::clone(&roots);
                 let categories = cfg.categories.clone();
                 Box::new(move |result| {
                     if ctx.stopped() {
@@ -330,6 +342,26 @@ fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
                     let Some(found) = detect::detect(path) else {
                         return WalkState::Continue;
                     };
+
+                    // Inside the cache home the artifact is an implementation
+                    // detail of a cache; the cache directory is the thing worth
+                    // reporting. Pruning here regardless of `--category` matches
+                    // how the curated cache roots behave: a `node_modules` that
+                    // is really part of a cache is not a node artifact.
+                    //
+                    // Only bucket when the bucket itself lies in a scanned root
+                    // -- naming a directory must never make the tool report a
+                    // path above it.
+                    if let Some(bucket) = cache_home
+                        .as_deref()
+                        .and_then(|home| detect::cache_bucket(home, path))
+                        && roots.iter().any(|root| bucket.starts_with(root))
+                    {
+                        if let Ok(mut set) = buckets.lock() {
+                            set.insert(bucket);
+                        }
+                        return WalkState::Skip;
+                    }
 
                     if found.category == Category::Pycache {
                         // Aggregated below: one artifact per project instead of
@@ -365,6 +397,29 @@ fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
                     WalkState::Skip
                 })
             });
+        }
+
+        // One Cache artifact per cache directory that turned out to hold
+        // artifacts. Sizing covers the whole bucket, not just the artifacts
+        // inside it, because the whole bucket is what deletion removes.
+        if cfg.categories.contains(&Category::Cache) {
+            let mut discovered: Vec<PathBuf> = buckets
+                .lock()
+                .map(|mut set| std::mem::take(&mut *set).into_iter().collect())
+                .unwrap_or_default();
+            discovered.sort();
+            for bucket in discovered {
+                if ctx.stopped() {
+                    break;
+                }
+                if !ctx.claim(&bucket) {
+                    continue;
+                }
+                let artifact = Artifact::new(ctx.next_id(), bucket, Category::Cache, None);
+                if !emit(&ctx, scope, artifact) {
+                    break;
+                }
+            }
         }
 
         // One Pycache artifact per project. Its path is the *project* dir and

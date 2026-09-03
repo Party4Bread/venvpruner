@@ -78,34 +78,132 @@ pub fn detect(dir: &Path) -> Option<Detected> {
     None
 }
 
-/// Well-known package-manager caches under `$HOME`, filtered to those present.
+/// Well-known package-manager cache roots, filtered to those that exist.
+///
+/// Each entry becomes a single `Cache` artifact and is pruned from the main
+/// walk. Whole-tree granularity is the point: `~/.cache/pnpm/dlx` holds one
+/// throwaway `node_modules` per `pnpm dlx` invocation, so walking into it
+/// turned one cache into dozens of rows that describe nothing the user chose
+/// to create and cannot be acted on individually.
+///
+/// `XDG_CACHE_HOME` and `XDG_DATA_HOME` are honoured when set to an absolute
+/// path; otherwise the usual `~/.cache` and `~/.local/share` apply.
 pub fn cache_roots() -> Vec<(PathBuf, Category)> {
-    const RELATIVE: [&str; 9] = [
-        ".cache/uv",
-        ".cache/pip",
-        ".cache/pypoetry",
-        ".cache/pdm",
-        ".cache/huggingface",
-        ".cargo/registry",
-        ".npm",
-        ".local/share/pnpm/store",
-        ".conda/pkgs",
-    ];
-
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = home_dir() else {
         return Vec::new();
     };
-    let home = PathBuf::from(home);
-    if home.as_os_str().is_empty() {
-        return Vec::new();
-    }
+    let cache_home = xdg_dir("XDG_CACHE_HOME", &home, ".cache");
+    let data_home = xdg_dir("XDG_DATA_HOME", &home, ".local/share");
+    cache_roots_in(&home, &cache_home, &data_home)
+}
 
-    RELATIVE
+/// `$XDG_CACHE_HOME`, or `~/.cache`. `None` when there is no usable `$HOME`.
+pub fn cache_home() -> Option<PathBuf> {
+    home_dir().map(|home| xdg_dir("XDG_CACHE_HOME", &home, ".cache"))
+}
+
+/// The top-level cache directory `path` belongs to, if it is in one.
+///
+/// Everything under the cache home is regenerable by definition, so an artifact
+/// found in there describes the tool that created it, not a directory the user
+/// made: `~/.cache/pnpm/dlx/<hash>/pkg/node_modules` is one `pnpm dlx`
+/// invocation out of dozens, and `~/.cache/node/corepack/v1/pnpm/<version>/
+/// dist/node_modules` is one downloaded pnpm out of a dozen more. Listing each
+/// separately buries the one directory a user would actually act on under rows
+/// that individually mean nothing.
+///
+/// The cache home itself yields `None`: the buckets inside it are what get
+/// reported, never the whole of `~/.cache` in one row.
+pub fn cache_bucket(cache_home: &Path, path: &Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix(cache_home).ok()?;
+    let first = rest.components().next()?;
+    match first {
+        std::path::Component::Normal(name) => Some(cache_home.join(name)),
+        _ => None,
+    }
+}
+
+/// True when `path` is a top-level directory of the cache home, i.e. exactly
+/// what [`cache_bucket`] hands back. Deletion re-proves cache artifacts against
+/// this, since a bucket is discovered by the walk rather than listed up front.
+pub fn is_cache_bucket(path: &Path) -> bool {
+    cache_home().is_some_and(|home| cache_bucket(&home, path).as_deref() == Some(path))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    (!home.as_os_str().is_empty()).then_some(home)
+}
+
+/// The cache roots for explicit base directories. Split out from
+/// [`cache_roots`] so the layout is testable without touching the environment.
+fn cache_roots_in(home: &Path, cache_home: &Path, data_home: &Path) -> Vec<(PathBuf, Category)> {
+    /// Fixed locations, relative to `$HOME`.
+    const UNDER_HOME: [&str; 5] = [
+        ".cargo/registry",
+        ".npm",
+        ".conda/pkgs",
+        ".bun/install/cache",
+        ".yarn/berry/cache",
+    ];
+    /// Relative to `$XDG_CACHE_HOME`, default `~/.cache`.
+    const UNDER_CACHE: [&str; 7] = [
+        "uv",
+        "pip",
+        "pypoetry",
+        "pdm",
+        "huggingface",
+        // pnpm keeps its store, its package metadata and the `dlx` scratch
+        // trees here; all of it is regenerable.
+        "pnpm",
+        "yarn",
+    ];
+    /// Relative to `$XDG_DATA_HOME`, default `~/.local/share`.
+    const UNDER_DATA: [&str; 1] = ["pnpm/store"];
+
+    let candidates = UNDER_HOME
         .iter()
         .map(|rel| home.join(rel))
-        .filter(|p| is_dir(p))
+        .chain(UNDER_CACHE.iter().map(|rel| cache_home.join(rel)))
+        .chain(UNDER_DATA.iter().map(|rel| data_home.join(rel)))
+        .filter(|p| is_dir(p));
+
+    outermost(candidates)
+        .into_iter()
         .map(|p| (p, Category::Cache))
         .collect()
+}
+
+/// Resolve an XDG base directory. A relative or empty value is ignored, as the
+/// spec requires, so a stray `XDG_CACHE_HOME=cache` cannot point the scanner at
+/// a path relative to the working directory.
+fn xdg_dir(var: &str, home: &Path, fallback: &str) -> PathBuf {
+    match std::env::var_os(var).map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => dir,
+        _ => home.join(fallback),
+    }
+}
+
+/// Drop every path that lies inside another, keeping the outermost.
+///
+/// The base directories are configurable and can be pointed at each other
+/// (`XDG_DATA_HOME=$HOME/.cache` nests `pnpm/store` inside `pnpm`). Two nested
+/// cache roots would be emitted as two artifacts covering overlapping bytes,
+/// double-counting the total and letting one deletion gut the other.
+fn outermost(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut sorted: Vec<PathBuf> = paths.into_iter().collect();
+    // Lexicographic order on components puts every ancestor before its descendants.
+    sorted.sort();
+    sorted.dedup();
+
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for path in sorted {
+        if kept.iter().any(|root| path.starts_with(root)) {
+            continue;
+        }
+        kept.push(path);
+    }
+    kept
 }
 
 /// Directories the walker must never descend into.
@@ -339,6 +437,144 @@ mod tests {
         let d = detect(&cache).unwrap();
         assert_eq!(d.category, Category::Pycache);
         assert_eq!(d.project.as_deref(), Some(pkg.as_path()));
+    }
+
+    /// Regression: `~/.cache/pnpm/dlx` holds one throwaway `node_modules` per
+    /// `pnpm dlx` invocation. With no cache root covering it the walker
+    /// descended and reported every one of them as a separate artifact, so a
+    /// pure cache showed up as a pile of rows. It is one directory.
+    #[test]
+    fn the_pnpm_cache_is_one_root_that_swallows_its_dlx_node_modules() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let dlx = home.join(".cache/pnpm/dlx");
+        for hash in ["0deb95f6", "1aa7da22", "36d0c130"] {
+            fs::create_dir_all(dlx.join(hash).join("pkg").join("node_modules")).unwrap();
+        }
+        fs::create_dir_all(home.join(".cache/pnpm/v11")).unwrap();
+
+        let roots = cache_roots_in(home, &home.join(".cache"), &home.join(".local/share"));
+        let paths: Vec<&Path> = roots.iter().map(|(p, _)| p.as_path()).collect();
+
+        assert_eq!(paths, vec![home.join(".cache/pnpm").as_path()]);
+        assert!(roots.iter().all(|(_, c)| *c == Category::Cache));
+    }
+
+    #[test]
+    fn cache_roots_skip_what_is_not_there() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join(".cargo/registry")).unwrap();
+        fs::create_dir_all(home.join(".local/share/pnpm/store")).unwrap();
+        // A file, not a directory: not a cache root.
+        touch(&home.join(".npm"));
+
+        let mut paths: Vec<PathBuf> =
+            cache_roots_in(home, &home.join(".cache"), &home.join(".local/share"))
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+        paths.sort();
+
+        assert_eq!(
+            paths,
+            vec![
+                home.join(".cargo/registry"),
+                home.join(".local/share/pnpm/store"),
+            ]
+        );
+    }
+
+    /// `XDG_DATA_HOME=$XDG_CACHE_HOME` nests `pnpm/store` inside `pnpm`. Two
+    /// overlapping roots would count the same bytes twice and let one deletion
+    /// gut the other, so only the outer one survives.
+    #[test]
+    fn nested_cache_roots_collapse_to_the_outermost() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let cache = home.join(".cache");
+        fs::create_dir_all(cache.join("pnpm/store")).unwrap();
+
+        let paths: Vec<PathBuf> = cache_roots_in(home, &cache, &cache)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(paths, vec![cache.join("pnpm")]);
+    }
+
+    /// The generalisation of the pnpm-dlx fix: every tool that shells out to a
+    /// package manager gets its own directory under the cache home, and each
+    /// one hides its own crop of `node_modules`. A curated list cannot keep up,
+    /// so anything under the cache home collapses to the directory that owns it.
+    #[test]
+    fn artifacts_under_the_cache_home_collapse_to_their_top_level_directory() {
+        let cache = Path::new("/home/u/.cache");
+        for (found, bucket) in [
+            (
+                "/home/u/.cache/pnpm/dlx/0deb95f6/pkg/node_modules",
+                "/home/u/.cache/pnpm",
+            ),
+            (
+                "/home/u/.cache/node/corepack/v1/pnpm/10.29.2/dist/node_modules",
+                "/home/u/.cache/node",
+            ),
+            (
+                "/home/u/.cache/typescript/6.0/node_modules",
+                "/home/u/.cache/typescript",
+            ),
+            (
+                "/home/u/.cache/pre-commit/repoabc/py_env-python3",
+                "/home/u/.cache/pre-commit",
+            ),
+            // A bucket handed its own path back is what `is_cache_bucket` checks.
+            ("/home/u/.cache/opencode", "/home/u/.cache/opencode"),
+        ] {
+            assert_eq!(
+                cache_bucket(cache, Path::new(found)).as_deref(),
+                Some(Path::new(bucket)),
+                "{found}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cache_home_itself_is_not_a_bucket() {
+        let cache = Path::new("/home/u/.cache");
+        // Reporting one row for the whole of ~/.cache is not a useful offer.
+        assert_eq!(cache_bucket(cache, cache), None);
+        // Nor is anything outside it a bucket, including a sibling whose name
+        // merely starts with the same string.
+        assert_eq!(
+            cache_bucket(cache, Path::new("/home/u/code/app/node_modules")),
+            None
+        );
+        assert_eq!(
+            cache_bucket(cache, Path::new("/home/u/.cachexyz/pnpm")),
+            None
+        );
+    }
+
+    #[test]
+    fn outermost_keeps_sibling_prefixes_apart() {
+        // "/c/pnpm2" starts with the *string* "/c/pnpm" but is not inside it.
+        let kept = outermost([
+            PathBuf::from("/c/pnpm"),
+            PathBuf::from("/c/pnpm2"),
+            PathBuf::from("/c/pnpm/dlx"),
+            PathBuf::from("/c/pnpm"),
+        ]);
+        assert_eq!(
+            kept,
+            vec![PathBuf::from("/c/pnpm"), PathBuf::from("/c/pnpm2")]
+        );
+    }
+
+    #[test]
+    fn xdg_dir_falls_back_to_home_when_the_variable_is_unset() {
+        assert_eq!(
+            xdg_dir("VENVPRUNER_XDG_TEST_UNSET", Path::new("/home/u"), ".cache"),
+            PathBuf::from("/home/u/.cache")
+        );
     }
 
     #[test]
