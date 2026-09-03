@@ -175,8 +175,8 @@ authoritative reference.
   top-level directory that owns it: `~/.cache/pnpm/dlx/<hash>/pkg/node_modules`
   is one `pnpm dlx` run out of dozens and `~/.cache/node/corepack/…/node_modules`
   one downloaded pnpm out of a dozen more — the directory worth acting on is
-  `~/.cache/pnpm` or `~/.cache/node`. `XDG_CACHE_HOME` and `XDG_DATA_HOME` are
-  honoured when set to an absolute path. Naming a root inside a cache
+  `~/.cache/pnpm` or `~/.cache/node`. `XDG_CACHE_HOME` is honoured when set to
+  an absolute path. Naming a root inside a cache
   (`venvpruner ~/.cache/node/corepack`) still lists what is in there.
 
 ## Development

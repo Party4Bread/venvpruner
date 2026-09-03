@@ -26,16 +26,10 @@ pub struct ScanConfig {
     pub one_file_system: bool,
     pub categories: HashSet<Category>,
     pub stale_after: Duration,
-    /// Worker threads for each of the two stages: the directory walk and the
-    /// sizing pool. `1` makes the whole scan serial. See [`cli::default_jobs`].
-    ///
-    /// The stages are given the same width rather than sharing one pool. They
-    /// overlap in time and block on different things -- the walk on `readdir`,
-    /// sizing on `stat` -- so a shared pool would let a burst of sizing jobs
-    /// starve discovery, and the UI would stop finding new artifacts while it
-    /// measured the ones it had.
-    ///
-    /// [`cli::default_jobs`]: crate::cli::default_jobs
+    /// Threads for each of the two stages, the walk and the sizing pool; `1`
+    /// scans serially. They get a pool each rather than sharing one: they run
+    /// at the same time and block on different things, `readdir` against
+    /// `stat`, so a burst of sizing jobs would otherwise starve discovery.
     pub jobs: usize,
 }
 
@@ -282,14 +276,12 @@ fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
         let pycache: Arc<Mutex<HashMap<PathBuf, Vec<PathBuf>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        // Top-level cache directories found to contain artifacts, emitted after
-        // the walk as one `Cache` artifact each. The curated `cache_roots` list
-        // cannot cover this on its own: every tool that shells out to a package
-        // manager gets its own directory under the cache home, and the list
-        // would have to grow forever to keep up.
-        let cache_home = Arc::new(detect::cache_home());
+        // Cache directories found to hold artifacts, emitted after the walk as
+        // one `Cache` artifact each. The curated `cache_roots` list cannot cover
+        // these: every tool that shells out to a package manager gets its own
+        // directory under the cache home, and the list would never keep up.
+        let cache_home = detect::cache_home();
         let buckets: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
-        let roots = Arc::new(cfg.roots.clone());
 
         if !cfg.roots.is_empty() && !ctx.stopped() {
             let mut builder = WalkBuilder::new(&cfg.roots[0]);
@@ -315,9 +307,9 @@ fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
                 let ctx = Arc::clone(&ctx);
                 let skip = Arc::clone(&skip);
                 let pycache = Arc::clone(&pycache);
-                let cache_home = Arc::clone(&cache_home);
                 let buckets = Arc::clone(&buckets);
-                let roots = Arc::clone(&roots);
+                let cache_home = cache_home.clone();
+                let roots = cfg.roots.clone();
                 let categories = cfg.categories.clone();
                 Box::new(move |result| {
                     if ctx.stopped() {
@@ -343,20 +335,19 @@ fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
                         return WalkState::Continue;
                     };
 
-                    // Inside the cache home the artifact is an implementation
-                    // detail of a cache; the cache directory is the thing worth
-                    // reporting. Pruning here regardless of `--category` matches
-                    // how the curated cache roots behave: a `node_modules` that
-                    // is really part of a cache is not a node artifact.
-                    //
-                    // Only bucket when the bucket itself lies in a scanned root
-                    // -- naming a directory must never make the tool report a
-                    // path above it.
-                    if let Some(bucket) = cache_home
+                    // Inside a cache the artifact is an implementation detail
+                    // of that cache, and the cache directory is what is worth
+                    // reporting. Pruning here whatever `--category` says matches
+                    // the curated cache roots: a `node_modules` that is really
+                    // part of a cache is not a node artifact.
+                    let bucket = cache_home
                         .as_deref()
-                        .and_then(|home| detect::cache_bucket(home, path))
-                        && roots.iter().any(|root| bucket.starts_with(root))
-                    {
+                        .and_then(|home| detect::cache_bucket(home, path));
+                    // A bucket above every scanned root is one the user did not
+                    // ask about; naming a directory must never make the tool
+                    // report a path above it.
+                    let was_scanned = |b: &PathBuf| roots.iter().any(|r| b.starts_with(r));
+                    if let Some(bucket) = bucket.filter(was_scanned) {
                         if let Ok(mut set) = buckets.lock() {
                             set.insert(bucket);
                         }
@@ -399,9 +390,8 @@ fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
             });
         }
 
-        // One Cache artifact per cache directory that turned out to hold
-        // artifacts. Sizing covers the whole bucket, not just the artifacts
-        // inside it, because the whole bucket is what deletion removes.
+        // Sizing covers the whole cache directory, not just the artifacts found
+        // inside it, because the whole directory is what deletion removes.
         if cfg.categories.contains(&Category::Cache) {
             let mut discovered: Vec<PathBuf> = buckets
                 .lock()

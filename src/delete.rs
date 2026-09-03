@@ -171,13 +171,12 @@ fn verify_category(path: &Path, expected: Category, cache_roots: &[PathBuf]) -> 
         return Ok(());
     }
     if expected == Category::Cache {
-        // Cache artifacts come from `detect::cache_roots()` -- the curated list
-        // of package-manager cache directories -- or from a top-level directory
-        // of the cache home that the walk found artifacts inside. Those two
-        // sources are what re-prove them. `detect()` has no arm that yields
-        // `Category::Cache` at all, so routing them through it rejected every
-        // single one.
-        if !cache_roots.iter().any(|c| c == path) && !detect::is_cache_bucket(path) {
+        // `detect()` has no arm that yields `Category::Cache` at all, so routing
+        // these through it rejected every single one. They are re-proved against
+        // the two things that produce them instead: the curated list of
+        // package-manager caches, and the cache home the walk finds them under.
+        let is_curated_root = cache_roots.iter().any(|c| c == path);
+        if !is_curated_root && !detect::is_cache_bucket(path) {
             return Err(format!(
                 "refusing to delete {shown}: it is not a known package-manager cache root"
             ));
