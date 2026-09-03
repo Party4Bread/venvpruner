@@ -71,6 +71,60 @@ fn coalesce_nested(mut grouped: HashMap<PathBuf, Vec<PathBuf>>) -> HashMap<PathB
     out
 }
 
+/// Artifacts the walk cannot emit on sight, because one row is assembled from
+/// directories it meets separately and far apart: every `__pycache__` beneath a
+/// project, and every artifact inside one cache directory. Both are collected
+/// as the walk runs and emitted once it has finished.
+#[derive(Default)]
+struct Deferred {
+    pycache: Mutex<HashMap<PathBuf, Vec<PathBuf>>>,
+    caches: Mutex<HashSet<PathBuf>>,
+}
+
+impl Deferred {
+    fn add_pycache(&self, project: PathBuf, dir: &Path) {
+        if let Ok(mut map) = self.pycache.lock() {
+            map.entry(project).or_default().push(dir.to_path_buf());
+        }
+    }
+
+    fn add_cache(&self, dir: PathBuf) {
+        if let Ok(mut set) = self.caches.lock() {
+            set.insert(dir);
+        }
+    }
+
+    /// The cache directories, in path order.
+    fn caches(&self) -> Vec<PathBuf> {
+        let mut caches: Vec<PathBuf> = self
+            .caches
+            .lock()
+            .map(|mut set| std::mem::take(&mut *set).into_iter().collect())
+            .unwrap_or_default();
+        caches.sort();
+        caches
+    }
+
+    /// One `(project, __pycache__ dirs)` group per project, nested projects
+    /// folded into their ancestor and each list sorted and deduplicated.
+    fn pycache_groups(&self) -> Vec<(PathBuf, Vec<PathBuf>)> {
+        let grouped = self
+            .pycache
+            .lock()
+            .map(|mut map| std::mem::take(&mut *map))
+            .unwrap_or_default();
+        coalesce_nested(grouped)
+            .into_iter()
+            .map(|(project, mut children)| {
+                children.sort();
+                children.dedup();
+                (project, children)
+            })
+            .filter(|(_, children)| !children.is_empty())
+            .collect()
+    }
+}
+
 struct Ctx {
     tx: Sender<ScanEvent>,
     sizer: size::Sizer,
@@ -199,12 +253,193 @@ fn emit<'scope>(ctx: &Arc<Ctx>, scope: &rayon::Scope<'scope>, artifact: Artifact
     true
 }
 
-fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
-    // A zero-width pool means "as many threads as rayon likes", which is the
-    // opposite of what `--jobs 0` would be asking for. The CLI rejects 0, so
-    // this only guards a caller constructing a config directly.
-    let jobs = cfg.jobs.max(1);
+/// The curated package-manager caches that lie inside a scan root.
+///
+/// Only those inside a root count. Emitting all of them unconditionally meant
+/// `venvpruner ~/some/project` reported every $HOME cache as if it had been
+/// found there -- tens of gigabytes the user never asked about, and totals that
+/// did not describe the directory they named.
+fn known_caches(cfg: &ScanConfig) -> Vec<(PathBuf, Category)> {
+    detect::cache_roots()
+        .into_iter()
+        .filter(|(path, _)| cfg.roots.iter().any(|root| path.starts_with(root)))
+        .collect()
+}
 
+/// Classify one directory the walk reached. Returns the state the walk should
+/// continue in; anything worth reporting is emitted or deferred on the way.
+///
+/// Every match prunes, even one `--category` filters out: the walk must never
+/// descend into an artifact. This is the main speed lever -- it is what avoids
+/// reading the interior of an 11 GB venv.
+fn visit<'scope>(
+    ctx: &Arc<Ctx>,
+    scope: &rayon::Scope<'scope>,
+    cfg: &ScanConfig,
+    deferred: &Deferred,
+    cache_home: Option<&Path>,
+    path: &Path,
+) -> WalkState {
+    let Some(found) = detect::detect(path) else {
+        return WalkState::Continue;
+    };
+
+    // Inside a cache the artifact is an implementation detail of that cache,
+    // and the cache directory is what is worth reporting. This applies whatever
+    // `--category` says, exactly as the curated caches do: a `node_modules` that
+    // is really part of a cache is not a node artifact.
+    //
+    // A cache directory above every scanned root is one the user did not ask
+    // about; naming a directory must never make the tool report a path above it.
+    let cache = cache_home.and_then(|home| detect::cache_bucket(home, path));
+    let was_scanned = |c: &PathBuf| cfg.roots.iter().any(|root| c.starts_with(root));
+    if let Some(cache) = cache.filter(was_scanned) {
+        deferred.add_cache(cache);
+        return WalkState::Skip;
+    }
+
+    if !cfg.categories.contains(&found.category) || !ctx.claim(path) {
+        return WalkState::Skip;
+    }
+
+    if found.category == Category::Pycache {
+        // Grouped per project instead of emitted as thousands of near-empty
+        // directories. `claim` above is on the `__pycache__` dir, so the project
+        // stays claimable by the group itself.
+        let project = found
+            .project
+            .unwrap_or_else(|| path.parent().unwrap_or(path).to_path_buf());
+        deferred.add_pycache(project, path);
+        return WalkState::Skip;
+    }
+
+    let artifact = Artifact::new(
+        ctx.next_id(),
+        path.to_path_buf(),
+        found.category,
+        found.project,
+    );
+    if !emit(ctx, scope, artifact) {
+        return WalkState::Quit;
+    }
+    WalkState::Skip
+}
+
+/// Walk every root, emitting what it finds and filling `deferred` with what it
+/// cannot report until the walk is over.
+fn walk<'scope>(
+    ctx: &Arc<Ctx>,
+    scope: &rayon::Scope<'scope>,
+    cfg: &ScanConfig,
+    deferred: &Arc<Deferred>,
+    skip: &Arc<HashSet<PathBuf>>,
+) {
+    if cfg.roots.is_empty() || ctx.stopped() {
+        return;
+    }
+    let cache_home = detect::cache_home();
+
+    let mut builder = WalkBuilder::new(&cfg.roots[0]);
+    for root in &cfg.roots[1..] {
+        builder.add(root);
+    }
+    // Every ignore rule is off on purpose: venvs, node_modules and target/ are
+    // nearly always gitignored, so a default walker finds nothing at all.
+    builder
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false)
+        .follow_links(false)
+        .same_file_system(cfg.one_file_system)
+        .max_depth(None)
+        .threads(cfg.jobs.max(1));
+
+    builder.build_parallel().run(|| {
+        let ctx = Arc::clone(ctx);
+        let skip = Arc::clone(skip);
+        let deferred = Arc::clone(deferred);
+        let cache_home = cache_home.clone();
+        Box::new(move |result| {
+            if ctx.stopped() {
+                return WalkState::Quit;
+            }
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(err) => {
+                    ctx.error(err.to_string());
+                    return WalkState::Continue;
+                }
+            };
+            if !entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                return WalkState::Continue;
+            }
+            let path = entry.path();
+            ctx.bump_dirs();
+
+            if skip.contains(path) || detect::is_skippable(path) {
+                return WalkState::Skip;
+            }
+            visit(&ctx, scope, cfg, &deferred, cache_home.as_deref(), path)
+        })
+    });
+}
+
+/// Emit the artifacts the walk could only assemble once it was over.
+fn emit_deferred<'scope>(
+    ctx: &Arc<Ctx>,
+    scope: &rayon::Scope<'scope>,
+    cfg: &ScanConfig,
+    deferred: &Deferred,
+) {
+    // Caches are pruned from the walk whatever `--category` says, but only
+    // reported when the user asked for them.
+    //
+    // Sizing covers the whole cache directory, not just the artifacts found
+    // inside it, because the whole directory is what deletion removes.
+    if cfg.categories.contains(&Category::Cache) {
+        for cache in deferred.caches() {
+            if ctx.stopped() {
+                return;
+            }
+            if !ctx.claim(&cache) {
+                continue;
+            }
+            let artifact = Artifact::new(ctx.next_id(), cache, Category::Cache, None);
+            if !emit(ctx, scope, artifact) {
+                return;
+            }
+        }
+    }
+
+    // A Pycache artifact's path is the *project* dir and its sizes are the sum
+    // over the `__pycache__` dirs in `children`; deleting it removes exactly
+    // those, never the project itself. The list comes from the walk that already
+    // honoured --one-file-system, so deletion never has to re-discover a set
+    // that could differ from the sized one.
+    for (project, children) in deferred.pycache_groups() {
+        if ctx.stopped() {
+            return;
+        }
+        if !ctx.claim(&project) {
+            continue;
+        }
+        let mut artifact = Artifact::new(
+            ctx.next_id(),
+            project.clone(),
+            Category::Pycache,
+            Some(project),
+        );
+        artifact.children = children;
+        if !emit(ctx, scope, artifact) {
+            return;
+        }
+    }
+}
+
+fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
     let ctx = Arc::new(Ctx {
         tx,
         sizer: size::Sizer::new(),
@@ -220,9 +455,11 @@ fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
     });
 
     // Sizing is `stat`-bound, not CPU-bound, and deliberately gets its own pool
-    // rather than rayon's global one.
+    // rather than rayon's global one. A zero-width pool would mean "as many
+    // threads as rayon likes", the opposite of what `--jobs 0` asks for; the CLI
+    // rejects 0, so this only guards a config built by hand.
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(jobs)
+        .num_threads(cfg.jobs.max(1))
         .thread_name(|i| format!("venvpruner-size-{i}"))
         .build();
     let pool = match pool {
@@ -235,213 +472,31 @@ fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
     };
 
     // Package-manager caches live under $HOME and would be traversed by the
-    // main walk; they are emitted directly and pruned from it instead.
-    //
-    // Only those actually inside a scan root count. Emitting all of them
-    // unconditionally meant `venvpruner ~/some/project` reported every $HOME
-    // cache as if it had been found there -- tens of gigabytes the user never
-    // asked about, and totals that did not describe the directory they named.
-    let cache_roots: Vec<(PathBuf, Category)> = detect::cache_roots()
-        .into_iter()
-        .filter(|(path, _)| cfg.roots.iter().any(|root| path.starts_with(root)))
-        .collect();
-    let skip: Arc<HashSet<PathBuf>> =
-        Arc::new(cache_roots.iter().map(|(p, _)| p.clone()).collect());
+    // walk; they are emitted directly and pruned from it instead.
+    let caches = known_caches(&cfg);
+    let skip: Arc<HashSet<PathBuf>> = Arc::new(caches.iter().map(|(p, _)| p.clone()).collect());
+    let deferred = Arc::new(Deferred::default());
 
     // `in_place_scope` keeps this thread as the scope owner (it blocks on the
     // walk) while spawned sizing jobs run on the pool. The scope does not
     // return until every job has finished, which is what makes the single
     // trailing Done event correct.
     pool.in_place_scope(|scope| {
-        for (path, category) in &cache_roots {
+        for (path, category) in caches {
             if ctx.stopped() {
                 break;
             }
-            if !cfg.categories.contains(category) {
+            if !cfg.categories.contains(&category) || !ctx.claim(&path) {
                 continue;
             }
-            if std::fs::symlink_metadata(path).is_err() {
-                continue;
-            }
-            if !ctx.claim(path) {
-                continue;
-            }
-            let artifact = Artifact::new(ctx.next_id(), path.clone(), *category, None);
+            let artifact = Artifact::new(ctx.next_id(), path, category, None);
             if !emit(&ctx, scope, artifact) {
                 break;
             }
         }
 
-        // project dir -> its __pycache__ dirs, aggregated after the walk.
-        let pycache: Arc<Mutex<HashMap<PathBuf, Vec<PathBuf>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-
-        // Cache directories found to hold artifacts, emitted after the walk as
-        // one `Cache` artifact each. The curated `cache_roots` list cannot cover
-        // these: every tool that shells out to a package manager gets its own
-        // directory under the cache home, and the list would never keep up.
-        let cache_home = detect::cache_home();
-        let buckets: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
-
-        if !cfg.roots.is_empty() && !ctx.stopped() {
-            let mut builder = WalkBuilder::new(&cfg.roots[0]);
-            for root in &cfg.roots[1..] {
-                builder.add(root);
-            }
-            // Every ignore rule is off on purpose: venvs, node_modules and
-            // target/ are nearly always gitignored, so a default walker finds
-            // nothing at all.
-            builder
-                .hidden(false)
-                .git_ignore(false)
-                .git_global(false)
-                .git_exclude(false)
-                .ignore(false)
-                .parents(false)
-                .follow_links(false)
-                .same_file_system(cfg.one_file_system)
-                .max_depth(None)
-                .threads(jobs);
-
-            builder.build_parallel().run(|| {
-                let ctx = Arc::clone(&ctx);
-                let skip = Arc::clone(&skip);
-                let pycache = Arc::clone(&pycache);
-                let buckets = Arc::clone(&buckets);
-                let cache_home = cache_home.clone();
-                let roots = cfg.roots.clone();
-                let categories = cfg.categories.clone();
-                Box::new(move |result| {
-                    if ctx.stopped() {
-                        return WalkState::Quit;
-                    }
-                    let entry = match result {
-                        Ok(entry) => entry,
-                        Err(err) => {
-                            ctx.error(err.to_string());
-                            return WalkState::Continue;
-                        }
-                    };
-                    if !entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                        return WalkState::Continue;
-                    }
-                    let path = entry.path();
-                    ctx.bump_dirs();
-
-                    if skip.contains(path) || detect::is_skippable(path) {
-                        return WalkState::Skip;
-                    }
-                    let Some(found) = detect::detect(path) else {
-                        return WalkState::Continue;
-                    };
-
-                    // Inside a cache the artifact is an implementation detail
-                    // of that cache, and the cache directory is what is worth
-                    // reporting. Pruning here whatever `--category` says matches
-                    // the curated cache roots: a `node_modules` that is really
-                    // part of a cache is not a node artifact.
-                    let bucket = cache_home
-                        .as_deref()
-                        .and_then(|home| detect::cache_bucket(home, path));
-                    // A bucket above every scanned root is one the user did not
-                    // ask about; naming a directory must never make the tool
-                    // report a path above it.
-                    let was_scanned = |b: &PathBuf| roots.iter().any(|r| b.starts_with(r));
-                    if let Some(bucket) = bucket.filter(was_scanned) {
-                        if let Ok(mut set) = buckets.lock() {
-                            set.insert(bucket);
-                        }
-                        return WalkState::Skip;
-                    }
-
-                    if found.category == Category::Pycache {
-                        // Aggregated below: one artifact per project instead of
-                        // thousands of near-empty directories.
-                        if categories.contains(&Category::Pycache) {
-                            let project = found
-                                .project
-                                .clone()
-                                .unwrap_or_else(|| path.parent().unwrap_or(path).to_path_buf());
-                            if let Ok(mut map) = pycache.lock() {
-                                map.entry(project).or_default().push(path.to_path_buf());
-                            }
-                        }
-                        return WalkState::Skip;
-                    }
-
-                    // Prune on match either way: never descend into an artifact,
-                    // even a filtered-out one. This is the main speed lever --
-                    // it avoids reading the interior of an 11G venv.
-                    if !categories.contains(&found.category) || !ctx.claim(path) {
-                        return WalkState::Skip;
-                    }
-
-                    let artifact = Artifact::new(
-                        ctx.next_id(),
-                        path.to_path_buf(),
-                        found.category,
-                        found.project,
-                    );
-                    if !emit(&ctx, scope, artifact) {
-                        return WalkState::Quit;
-                    }
-                    WalkState::Skip
-                })
-            });
-        }
-
-        // Sizing covers the whole cache directory, not just the artifacts found
-        // inside it, because the whole directory is what deletion removes.
-        if cfg.categories.contains(&Category::Cache) {
-            let mut discovered: Vec<PathBuf> = buckets
-                .lock()
-                .map(|mut set| std::mem::take(&mut *set).into_iter().collect())
-                .unwrap_or_default();
-            discovered.sort();
-            for bucket in discovered {
-                if ctx.stopped() {
-                    break;
-                }
-                if !ctx.claim(&bucket) {
-                    continue;
-                }
-                let artifact = Artifact::new(ctx.next_id(), bucket, Category::Cache, None);
-                if !emit(&ctx, scope, artifact) {
-                    break;
-                }
-            }
-        }
-
-        // One Pycache artifact per project. Its path is the *project* dir and
-        // its sizes are the sum over the `__pycache__` dirs recorded in
-        // `children`; deleting it means removing exactly those, never the
-        // project itself. The list is captured here, by the walk that already
-        // honoured --one-file-system and pruned other artifacts, so deletion
-        // never has to re-discover a set that could differ from the sized one.
-        let grouped = pycache
-            .lock()
-            .map(|mut map| std::mem::take(&mut *map))
-            .unwrap_or_default();
-        for (project, mut children) in coalesce_nested(grouped) {
-            if ctx.stopped() {
-                break;
-            }
-            children.sort();
-            children.dedup();
-            if children.is_empty() || !ctx.claim(&project) {
-                continue;
-            }
-            let mut artifact = Artifact::new(
-                ctx.next_id(),
-                project.clone(),
-                Category::Pycache,
-                Some(project),
-            );
-            artifact.children = children;
-            if !emit(&ctx, scope, artifact) {
-                break;
-            }
-        }
+        walk(&ctx, scope, &cfg, &deferred, &skip);
+        emit_deferred(&ctx, scope, &cfg, &deferred);
     });
 
     // The scope has joined every sizing job, so these totals are final.
