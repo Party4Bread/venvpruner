@@ -165,6 +165,11 @@ authoritative reference.
   `--jobs` more measure the artifacts they find. Both stages are IO-bound, so
   the useful number tracks the disk more than the CPU — lower it with `-j` on a
   spinning disk or a network mount.
+- pnpm's `.pnpm` virtual store counts as a `node_modules`: one row, not one per
+  installed package. Under `$PNPM_HOME/global` it is reported with no owning
+  project, like a uv tool or a pipx venv — those are the CLI tools on your
+  `$PATH`, so they are shown but never badged `SAFE` and never listed by
+  `--dry-run`.
 - Caches are reported one row per cache directory, never as their contents.
   Anything found under `$XDG_CACHE_HOME` (default `~/.cache`) collapses to the
   top-level directory that owns it: `~/.cache/pnpm/dlx/<hash>/pkg/node_modules`

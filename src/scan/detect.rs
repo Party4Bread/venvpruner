@@ -27,6 +27,8 @@ const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55"
 
 const UV_TOOLS: [&str; 4] = [".local", "share", "uv", "tools"];
 const PIPX_VENVS: [&str; 4] = [".local", "share", "pipx", "venvs"];
+/// `$PNPM_HOME/global`, wherever `$PNPM_HOME` happens to be.
+const PNPM_GLOBAL: [&str; 2] = ["pnpm", "global"];
 
 const SYSTEM_DIRS: [&str; 5] = ["/proc", "/sys", "/dev", "/run", "/tmp"];
 
@@ -48,18 +50,35 @@ pub fn detect(dir: &Path) -> Option<Detected> {
 
     let name = dir.file_name();
 
-    if name == Some(OsStr::new("node_modules")) {
-        // Every `node_modules` is an artifact, with or without a sibling
-        // manifest. Requiring one used to gate detection, which had exactly the
-        // opposite of the intended effect: a global npm root (`lib/node_modules`,
-        // no `lib/package.json`) failed to match, the walker descended, and each
-        // installed package inside matched on its own manifest -- reporting one
-        // 1.8 GB tree as 108 nested fragments.
-        //
-        // The manifest now only identifies the owning project for activity and
-        // lockfile signals. Nesting is prevented by pruning in the walker, which
-        // never descends into a `node_modules` regardless of what is returned
-        // here.
+    // A `node_modules` and pnpm's `.pnpm` virtual store are the same thing: the
+    // installed packages belonging to the directory above.
+    //
+    // Both match on the name alone, with or without a sibling manifest.
+    // Requiring one used to gate `node_modules` detection, which had exactly
+    // the opposite of the intended effect: a global npm root
+    // (`lib/node_modules`, no `lib/package.json`) failed to match, the walker
+    // descended, and each installed package inside matched on its own manifest
+    // -- reporting one 1.8 GB tree as 108 nested fragments.
+    //
+    // `.pnpm` normally sits *inside* a `node_modules` and is never reached,
+    // because the walk prunes there. pnpm's global install directory puts it
+    // beside `node_modules` instead, where the walk went straight in and
+    // reported one 153 MB store as 417 fragments of itself, one row per
+    // installed package.
+    //
+    // The manifest now only identifies the owning project, for activity and
+    // lockfile signals. Nesting is prevented by pruning in the walker, which
+    // never descends into either directory regardless of what is returned here.
+    if name == Some(OsStr::new("node_modules")) || name == Some(OsStr::new(".pnpm")) {
+        // Under pnpm's global directory these hold installed CLI tools, the way
+        // a uv tool or a pipx venv does: whatever is on `$PATH` resolves into
+        // them, and the directory above is pnpm's own bookkeeping rather than a
+        // project whose activity says anything about them. Reporting no project
+        // keeps them off the `SAFE` badge for the same reason those two are:
+        // the bytes are worth showing, the call is not ours to make.
+        if has_component_run(dir, &PNPM_GLOBAL) {
+            return Some(Detected::new(Category::NodeModules, None));
+        }
         let project = dir
             .parent()
             .filter(|p| is_regular_file(&p.join("package.json")))
@@ -371,6 +390,57 @@ mod tests {
         // With a manifest the project is identified, for activity signals.
         touch(&proj.join("package.json"));
         let d = detect(&nm).expect("node_modules with manifest should be detected");
+        assert_eq!(d.category, Category::NodeModules);
+        assert_eq!(d.project.as_deref(), Some(proj.as_path()));
+    }
+
+    /// Regression: pnpm's global install directory keeps its virtual store
+    /// *beside* `node_modules` rather than inside it, so the walk descended and
+    /// reported one 153 MB store as 417 rows -- one per installed package.
+    #[test]
+    fn a_pnpm_virtual_store_is_one_artifact_not_one_per_package() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("global/5/.pnpm");
+        for pkg in ["typescript@5.9.3", "lodash@4.17.23", "@types+node@25.4.0"] {
+            fs::create_dir_all(store.join(pkg).join("node_modules")).unwrap();
+        }
+
+        let d = detect(&store).expect("a virtual store is an artifact on its own");
+        assert_eq!(d.category, Category::NodeModules);
+    }
+
+    /// A `.pnpm` under `$PNPM_HOME/global` holds installed CLI tools that
+    /// `$PATH` resolves into, not build output of a project. Reporting no
+    /// project is what keeps it off the `SAFE` badge, exactly as for a uv tool
+    /// or a pipx venv -- the bytes get shown, the call stays with the user.
+    #[test]
+    fn pnpm_global_installs_report_no_owning_project() {
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join(".local/share/pnpm/global/5");
+        fs::create_dir_all(global.join(".pnpm")).unwrap();
+        fs::create_dir_all(global.join("node_modules")).unwrap();
+        // pnpm writes both of these; they would otherwise read as "rebuildable".
+        touch(&global.join("package.json"));
+        touch(&global.join("pnpm-lock.yaml"));
+
+        for dir in [global.join(".pnpm"), global.join("node_modules")] {
+            let d = detect(&dir).unwrap();
+            assert_eq!(d.category, Category::NodeModules);
+            assert_eq!(d.project, None, "{}", dir.display());
+        }
+    }
+
+    #[test]
+    fn a_project_local_virtual_store_keeps_its_project() {
+        // Not under pnpm's global dir: a `virtual-store-dir` pointed out of
+        // `node_modules` still belongs to the project beside it.
+        let tmp = TempDir::new().unwrap();
+        let proj = tmp.path().join("app");
+        let store = proj.join(".pnpm");
+        fs::create_dir_all(&store).unwrap();
+        touch(&proj.join("package.json"));
+
+        let d = detect(&store).unwrap();
         assert_eq!(d.category, Category::NodeModules);
         assert_eq!(d.project.as_deref(), Some(proj.as_path()));
     }

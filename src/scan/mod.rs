@@ -508,6 +508,58 @@ mod tests {
         );
     }
 
+    /// Regression for pnpm's global install dir: the virtual store sits beside
+    /// `node_modules` instead of inside it, so the walk descended into it and
+    /// emitted one artifact per installed package. A real scan reported 417
+    /// rows for one 153 MB store.
+    #[test]
+    fn a_pnpm_global_install_is_two_artifacts_not_one_per_installed_package() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let global = root.join(".local/share/pnpm/global/5");
+        let store = global.join(".pnpm");
+        for pkg in [
+            "typescript@5.9.3",
+            "lodash@4.17.23",
+            "ungit@1.5.30",
+            "zod@4.4.3",
+        ] {
+            let inner = store.join(pkg).join("node_modules").join("pkg");
+            std::fs::create_dir_all(&inner).unwrap();
+            std::fs::write(inner.join("index.js"), "x").unwrap();
+            std::fs::write(
+                store.join(pkg).join("node_modules").join("package.json"),
+                "{}",
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(global.join("node_modules")).unwrap();
+        std::fs::write(global.join("package.json"), "{}").unwrap();
+
+        let cfg = ScanConfig {
+            roots: vec![root.clone()],
+            one_file_system: false,
+            categories: [Category::NodeModules].into_iter().collect(),
+            stale_after: std::time::Duration::from_secs(90 * 86_400),
+            jobs: 4,
+        };
+
+        let mut found: Vec<PathBuf> = spawn(cfg)
+            .into_iter()
+            .filter_map(|ev| match ev {
+                ScanEvent::Found(a) => Some(a.path.clone()),
+                _ => None,
+            })
+            .collect();
+        found.sort();
+
+        assert_eq!(
+            found,
+            vec![store, global.join("node_modules")],
+            "the store and the link farm, never their contents"
+        );
+    }
+
     /// Regression: scanning a specific directory used to also report every
     /// well-known $HOME cache, so `venvpruner ~/some/project` claimed tens of
     /// gigabytes that were nowhere near the path the user named.
