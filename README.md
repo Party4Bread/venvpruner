@@ -89,6 +89,9 @@ venvpruner --json --category node --older-than 90d \
 
 # Cross filesystem boundaries (off by default) and treat 30 days as stale
 venvpruner --all-filesystems --stale-after 30d
+
+# Keep the scan out of the way of a build: two threads per stage instead of all of them
+venvpruner -j2
 ```
 
 ### Options
@@ -104,6 +107,7 @@ venvpruner --all-filesystems --stale-after 30d
 | `--no-tui` | Scan, print a table, exit. |
 | `--dry-run` | Print what a cleanup would remove, delete nothing, exit. |
 | `--all-filesystems` | Follow the walk across mount points. Off by default. |
+| `--jobs`, `-j <N>` | Worker threads for the walk and for sizing. Defaults to the machine's parallelism (capped at 32); `-j1` scans serially. |
 
 Durations accept `s`, `min`, `h`, `d`, `w`, `mo` (30 days) and `y` (365 days).
 A bare `m` is rejected on purpose — it reads as both minutes and months, so
@@ -157,6 +161,10 @@ authoritative reference.
   sizing, not during deletion.
 - The walk stays on one filesystem by default, so network mounts and external
   drives do not silently join the scan.
+- The scan is parallel by default: `--jobs` threads walk directories while
+  `--jobs` more measure the artifacts they find. Both stages are IO-bound, so
+  the useful number tracks the disk more than the CPU — lower it with `-j` on a
+  spinning disk or a network mount.
 
 ## Development
 

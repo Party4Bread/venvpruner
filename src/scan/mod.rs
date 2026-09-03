@@ -17,10 +17,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-/// Dedicated sizing pool width. Sizing is `stat`-bound, not CPU-bound, so this
-/// is deliberately independent of the global rayon pool.
-const SIZING_THREADS: usize = 8;
-
 /// Lower bound on the gap between two [`ScanEvent::Progress`] sends (~20/s).
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -30,6 +26,17 @@ pub struct ScanConfig {
     pub one_file_system: bool,
     pub categories: HashSet<Category>,
     pub stale_after: Duration,
+    /// Worker threads for each of the two stages: the directory walk and the
+    /// sizing pool. `1` makes the whole scan serial. See [`cli::default_jobs`].
+    ///
+    /// The stages are given the same width rather than sharing one pool. They
+    /// overlap in time and block on different things -- the walk on `readdir`,
+    /// sizing on `stat` -- so a shared pool would let a burst of sizing jobs
+    /// starve discovery, and the UI would stop finding new artifacts while it
+    /// measured the ones it had.
+    ///
+    /// [`cli::default_jobs`]: crate::cli::default_jobs
+    pub jobs: usize,
 }
 
 /// Start a scan. Returns at once; every event arrives on the returned channel,
@@ -198,14 +205,12 @@ fn emit<'scope>(ctx: &Arc<Ctx>, scope: &rayon::Scope<'scope>, artifact: Artifact
     true
 }
 
-fn walk_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(4, 16)
-}
-
 fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
+    // A zero-width pool means "as many threads as rayon likes", which is the
+    // opposite of what `--jobs 0` would be asking for. The CLI rejects 0, so
+    // this only guards a caller constructing a config directly.
+    let jobs = cfg.jobs.max(1);
+
     let ctx = Arc::new(Ctx {
         tx,
         sizer: size::Sizer::new(),
@@ -220,8 +225,10 @@ fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
         seen: Mutex::new(HashSet::new()),
     });
 
+    // Sizing is `stat`-bound, not CPU-bound, and deliberately gets its own pool
+    // rather than rayon's global one.
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(SIZING_THREADS)
+        .num_threads(jobs)
         .thread_name(|i| format!("venvpruner-size-{i}"))
         .build();
     let pool = match pool {
@@ -293,7 +300,7 @@ fn run_scan(cfg: ScanConfig, tx: Sender<ScanEvent>) {
                 .follow_links(false)
                 .same_file_system(cfg.one_file_system)
                 .max_depth(None)
-                .threads(walk_threads());
+                .threads(jobs);
 
             builder.build_parallel().run(|| {
                 let ctx = Arc::clone(&ctx);
@@ -429,6 +436,7 @@ mod tests {
             one_file_system: false,
             categories: [Category::NodeModules].into_iter().collect(),
             stale_after: std::time::Duration::from_secs(90 * 86_400),
+            jobs: 4,
         };
 
         let mut found: Vec<PathBuf> = Vec::new();
@@ -461,6 +469,7 @@ mod tests {
             one_file_system: false,
             categories: Category::ALL.into_iter().collect(),
             stale_after: std::time::Duration::from_secs(90 * 86_400),
+            jobs: 4,
         };
 
         let found: Vec<PathBuf> = spawn(cfg)
@@ -476,6 +485,54 @@ mod tests {
             "every artifact must lie inside the scanned root; got {found:?}"
         );
         assert_eq!(found, vec![venv]);
+    }
+
+    /// `--jobs` changes how many threads do the work, never what the work finds.
+    /// A serial scan is the debugging path; it has to agree with the parallel
+    /// one artifact for artifact.
+    #[test]
+    fn the_job_count_does_not_change_what_a_scan_finds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        for n in 0..8 {
+            let proj = root.join(format!("proj{n}"));
+            std::fs::create_dir_all(proj.join(".venv")).unwrap();
+            std::fs::write(
+                proj.join(".venv").join("pyvenv.cfg"),
+                "version_info = 3.12\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(proj.join("node_modules").join("dep")).unwrap();
+            std::fs::write(proj.join("package.json"), "{}").unwrap();
+            std::fs::create_dir_all(proj.join("pkg").join("__pycache__")).unwrap();
+        }
+
+        let scan_with = |jobs: usize| -> Vec<PathBuf> {
+            let cfg = ScanConfig {
+                roots: vec![root.clone()],
+                one_file_system: false,
+                categories: Category::ALL.into_iter().collect(),
+                stale_after: std::time::Duration::from_secs(90 * 86_400),
+                jobs,
+            };
+            let mut found: Vec<PathBuf> = spawn(cfg)
+                .into_iter()
+                .filter_map(|ev| match ev {
+                    ScanEvent::Found(a) => Some(a.path.clone()),
+                    _ => None,
+                })
+                .collect();
+            found.sort();
+            found
+        };
+
+        let serial = scan_with(1);
+        assert_eq!(
+            serial.len(),
+            8 * 3,
+            "8 projects x venv + node_modules + pycache"
+        );
+        assert_eq!(serial, scan_with(8));
     }
 
     #[test]

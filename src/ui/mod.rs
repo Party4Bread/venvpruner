@@ -1059,6 +1059,7 @@ mod tests {
             one_file_system: false,
             categories: Category::ALL.into_iter().collect::<HashSet<_>>(),
             stale_after: Duration::from_secs(60 * 60 * 24 * 30),
+            jobs: 4,
         }
     }
 

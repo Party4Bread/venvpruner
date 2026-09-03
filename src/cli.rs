@@ -74,6 +74,10 @@ pub struct Args {
     /// Cross filesystem boundaries while walking (off by default).
     #[arg(long)]
     pub all_filesystems: bool,
+
+    /// Worker threads per stage. Defaults to the machine's parallelism; 1 scans serially.
+    #[arg(long, short = 'j', value_name = "N", value_parser = parse_jobs)]
+    pub jobs: Option<usize>,
 }
 
 impl Args {
@@ -94,6 +98,7 @@ impl Args {
             one_file_system: !self.all_filesystems,
             categories,
             stale_after: self.stale_after,
+            jobs: self.jobs.unwrap_or_else(default_jobs),
         })
     }
 
@@ -120,6 +125,33 @@ impl Args {
         }
         Ok(out)
     }
+}
+
+/// Worker threads per stage when `--jobs` is not given.
+///
+/// One per logical CPU, so a 32-core machine is not held to the four threads a
+/// laptop gets. The upper bound keeps a very wide host from pointing hundreds
+/// of `stat`-bound threads at one disk, where the queue depth stops helping
+/// well before that and contention starts costing.
+pub fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, 32)
+}
+
+/// Parse `--jobs`. Zero is rejected rather than silently meaning "auto": a
+/// caller writing `-j0` in a script is asking for something, and picking a
+/// count for them would hide the mistake.
+fn parse_jobs(s: &str) -> std::result::Result<usize, String> {
+    let text = s.trim();
+    let value: usize = text
+        .parse()
+        .map_err(|_| format!("invalid job count {s:?}: expected a whole number, e.g. 8"))?;
+    if value == 0 {
+        return Err("job count must be at least 1; omit --jobs to size it to the machine".into());
+    }
+    Ok(value)
 }
 
 fn parse_category(s: &str) -> std::result::Result<Category, String> {
@@ -364,6 +396,7 @@ mod tests {
             no_tui: true,
             dry_run: false,
             all_filesystems: false,
+            jobs: None,
         };
         let err = args.scan_config().unwrap_err();
         let text = format!("{err:#}");
@@ -384,11 +417,65 @@ mod tests {
             no_tui: true,
             dry_run: false,
             all_filesystems: false,
+            jobs: None,
         };
         let cfg = args.scan_config().unwrap();
         assert_eq!(cfg.categories.len(), Category::ALL.len());
         assert!(cfg.one_file_system);
         assert_eq!(cfg.roots.len(), 1);
+    }
+
+    #[test]
+    fn jobs_defaults_to_the_machine_and_is_never_degenerate() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = Args {
+            roots: vec![dir.path().to_path_buf()],
+            min_size: 0,
+            older_than: None,
+            category: Vec::new(),
+            stale_after: Duration::from_secs(90 * DAY),
+            json: false,
+            no_tui: true,
+            dry_run: false,
+            all_filesystems: false,
+            jobs: None,
+        };
+        let cfg = args.scan_config().unwrap();
+        assert_eq!(cfg.jobs, default_jobs());
+        // A single-threaded scan would be the slow path nobody asked for, and a
+        // pool of zero means "rayon decides".
+        assert!(cfg.jobs >= 2, "default of {} is not parallel", cfg.jobs);
+    }
+
+    #[test]
+    fn an_explicit_job_count_is_used_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = Args {
+            roots: vec![dir.path().to_path_buf()],
+            min_size: 0,
+            older_than: None,
+            category: Vec::new(),
+            stale_after: Duration::from_secs(90 * DAY),
+            json: false,
+            no_tui: true,
+            dry_run: false,
+            all_filesystems: false,
+            jobs: Some(1),
+        };
+        assert_eq!(args.scan_config().unwrap().jobs, 1);
+    }
+
+    #[test]
+    fn zero_jobs_is_rejected_rather_than_silently_meaning_auto() {
+        assert_eq!(parse_jobs("8").unwrap(), 8);
+        assert_eq!(parse_jobs(" 2 ").unwrap(), 2);
+
+        let err = parse_jobs("0").unwrap_err();
+        assert!(err.contains("at least 1"), "{err}");
+
+        let err = parse_jobs("-1").unwrap_err();
+        assert!(err.contains("whole number"), "{err}");
+        assert!(parse_jobs("many").is_err());
     }
 
     #[test]
@@ -404,6 +491,7 @@ mod tests {
             no_tui: true,
             dry_run: false,
             all_filesystems: true,
+            jobs: Some(1),
         };
         let cfg = args.scan_config().unwrap();
         assert_eq!(cfg.roots.len(), 1);
