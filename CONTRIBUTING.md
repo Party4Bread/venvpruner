@@ -104,7 +104,8 @@ unfixed code. Several tests in this repo exist because that step caught a
 
 ## Scope
 
-The tool is Linux-only and uses `std::os::unix::fs::MetadataExt` throughout.
+The tool runs on Linux and macOS and uses `std::os::unix::fs::MetadataExt`
+throughout. CI runs the checks on both.
 Portability patches are welcome but must not weaken the sizing model —
 if `st_blocks` or `st_nlink` are unavailable on a target, that target needs a
 different accounting story, not a silent fallback to `st_size`.

@@ -18,13 +18,21 @@ env:
 jobs:
   build:
     name: build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          # Each macOS target builds on its own architecture, so the smoke test
+          # below runs the binary natively rather than trusting Rosetta.
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +47,7 @@ jobs:
 
       # The crate is pure Rust with no C dependencies, so `rust-lld` links the
       # static musl binary for either architecture. No Docker and no `cross`.
+      # macOS uses the system linker; these variables do not apply there.
       - name: Build
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
@@ -52,6 +61,28 @@ jobs:
           test -x "$bin"
           desc=$(file "$bin")
           echo "$desc"
+          mkdir -p dist
+          if [ "${{ runner.os }}" = macOS ]; then
+            # Nothing links libc statically on macOS; libSystem is the stable
+            # interface. What must not appear is anything outside the OS, such
+            # as a Homebrew dylib that exists only on the build machine.
+            case "$desc" in
+              *"Mach-O 64-bit executable"*) ;;
+              *)
+                echo "::error::$bin is not a Mach-O executable: $desc"
+                exit 1
+                ;;
+            esac
+            otool -L "$bin"
+            foreign=$(otool -L "$bin" | tail -n +2 | awk '{ print $1 }' \
+              | grep -Ev '^(/usr/lib/|/System/Library/)' || true)
+            if [ -n "$foreign" ]; then
+              echo "::error::$bin links libraries outside the OS: $foreign"
+              exit 1
+            fi
+            cp "$bin" "dist/venvpruner-${{ matrix.target }}"
+            exit 0
+          fi
           # A dynamically linked asset would fail on any host without a matching
           # libc, so make it a hard error rather than a warning.
           #
@@ -70,7 +101,6 @@ jobs:
               exit 1
               ;;
           esac
-          mkdir -p dist
           cp "$bin" "dist/venvpruner-${{ matrix.target }}"
 
       # Actually run the binary before publishing it. aarch64 runs under qemu,
@@ -103,6 +133,12 @@ jobs:
             aarch64-linux-gnu-strip "dist/venvpruner-${{ matrix.target }}"
           else
             strip "dist/venvpruner-${{ matrix.target }}"
+          fi
+          if [ "${{ runner.os }}" = macOS ]; then
+            # Apple silicon refuses to run unsigned code, and stripping voids
+            # the linker's ad-hoc signature. Sign again and prove it launches.
+            codesign --force --sign - "dist/venvpruner-${{ matrix.target }}"
+            "dist/venvpruner-${{ matrix.target }}" --version
           fi
 
       - uses: actions/upload-artifact@v4

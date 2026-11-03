@@ -26,11 +26,26 @@ impl Detected {
 const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 
 const UV_TOOLS: [&str; 4] = [".local", "share", "uv", "tools"];
-const PIPX_VENVS: [&str; 4] = [".local", "share", "pipx", "venvs"];
+/// Every place a pipx release has defaulted to: the XDG data dir on Linux,
+/// platformdirs' data dir on macOS, and the `~/.local/pipx` both used before
+/// that -- which pipx keeps using wherever it already exists.
+const PIPX_VENVS: [&[&str]; 3] = [
+    &[".local", "share", "pipx", "venvs"],
+    &["Library", "Application Support", "pipx", "venvs"],
+    &[".local", "pipx", "venvs"],
+];
 /// `$PNPM_HOME/global`, wherever `$PNPM_HOME` happens to be.
 const PNPM_GLOBAL: [&str; 2] = ["pnpm", "global"];
 
-const SYSTEM_DIRS: [&str; 5] = ["/proc", "/sys", "/dev", "/run", "/tmp"];
+#[cfg(not(target_os = "macos"))]
+const SYSTEM_DIRS: &[&str] = &["/proc", "/sys", "/dev", "/run", "/tmp"];
+/// `/tmp` is a symlink here and never followed; `/private/tmp` is what it
+/// points at and `/private/var/folders` holds every per-user `$TMPDIR`.
+/// `/System` is the sealed system volume, and under it `/System/Volumes/Data`
+/// is the data volume again, so `--all-filesystems` from `/` would otherwise
+/// report every artifact twice.
+#[cfg(target_os = "macos")]
+const SYSTEM_DIRS: &[&str] = &["/dev", "/System", "/private/tmp", "/private/var/folders"];
 
 /// Classify `dir`. Returns `Some` only when `dir` itself is the artifact root.
 pub fn detect(dir: &Path) -> Option<Detected> {
@@ -38,7 +53,7 @@ pub fn detect(dir: &Path) -> Option<Detected> {
         if has_component_run(dir, &UV_TOOLS) {
             return Some(Detected::new(Category::UvTool, None));
         }
-        if has_component_run(dir, &PIPX_VENVS) {
+        if PIPX_VENVS.iter().any(|run| has_component_run(dir, run)) {
             return Some(Detected::new(Category::Pipx, None));
         }
         return Some(Detected::new(Category::PyVenv, parent_of(dir)));
@@ -96,37 +111,58 @@ pub fn detect(dir: &Path) -> Option<Detected> {
 /// entry here, `~/.cache/uv` is just an opaque pile of files. Caches that *do*
 /// hold recognisable artifacts are found by [`cache_bucket`] instead.
 pub fn cache_roots() -> Vec<(PathBuf, Category)> {
-    const UNDER_HOME: [&str; 5] = [
+    const UNDER_HOME: [&str; 6] = [
         ".cargo/registry",
         ".npm",
         ".conda/pkgs",
         ".local/share/pnpm/store",
+        // pnpm's store on macOS.
+        "Library/pnpm/store",
         // Not under the cache home, so `cache_bucket` cannot reach it, and the
         // cached packages ship test fixtures with `node_modules` in them.
         ".bun/install/cache",
     ];
     const UNDER_CACHE: [&str; 6] = ["uv", "pip", "pypoetry", "pdm", "huggingface", "pnpm"];
 
-    let (Some(home), Some(cache_home)) = (home_dir(), cache_home()) else {
+    let Some(home) = home_dir() else {
         return Vec::new();
     };
+    let cache_homes = cache_homes();
     UNDER_HOME
         .iter()
         .map(|rel| home.join(rel))
-        .chain(UNDER_CACHE.iter().map(|rel| cache_home.join(rel)))
+        .chain(
+            cache_homes
+                .iter()
+                .flat_map(|cache| UNDER_CACHE.iter().map(|rel| cache.join(rel))),
+        )
         .filter(|p| is_dir(p))
         .map(|p| (p, Category::Cache))
         .collect()
 }
 
+/// Every directory tools treat as their cache home.
+///
 /// `$XDG_CACHE_HOME` when it is absolute, else `~/.cache`. A relative value is
 /// ignored as the XDG spec requires, so a stray `XDG_CACHE_HOME=cache` cannot
 /// point the scanner at the working directory.
-pub fn cache_home() -> Option<PathBuf> {
-    match std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
-        Some(dir) if dir.is_absolute() => Some(dir),
-        _ => Some(home_dir()?.join(".cache")),
+///
+/// macOS has two in practice: uv and huggingface keep to the XDG location
+/// there too, while pip, poetry, pdm and pnpm use `~/Library/Caches`.
+pub fn cache_homes() -> Vec<PathBuf> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    let xdg = match std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => dir,
+        _ => home.join(".cache"),
+    };
+    let mut homes = vec![xdg];
+    let library = home.join("Library/Caches");
+    if cfg!(target_os = "macos") && !homes.contains(&library) {
+        homes.push(library);
     }
+    homes
 }
 
 /// The top-level cache directory `path` sits in, if it is in one.
@@ -149,7 +185,9 @@ pub fn cache_bucket(cache_home: &Path, path: &Path) -> Option<PathBuf> {
 /// re-proves cache artifacts against this, since a bucket is discovered by the
 /// walk rather than listed up front.
 pub fn is_cache_bucket(path: &Path) -> bool {
-    cache_home().is_some_and(|home| cache_bucket(&home, path).as_deref() == Some(path))
+    cache_homes()
+        .iter()
+        .any(|home| cache_bucket(home, path).as_deref() == Some(path))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -284,6 +322,22 @@ mod tests {
         let d = detect(&venv).expect("pipx venv should be detected");
         assert_eq!(d.category, Category::Pipx);
         assert_eq!(d.project, None);
+    }
+
+    #[test]
+    fn pipx_macos_and_legacy_homes_yield_pipx() {
+        let tmp = TempDir::new().unwrap();
+        for rel in [
+            "Library/Application Support/pipx/venvs/black",
+            ".local/pipx/venvs/black",
+        ] {
+            let venv = tmp.path().join(rel);
+            touch(&venv.join("pyvenv.cfg"));
+
+            let d = detect(&venv).expect(rel);
+            assert_eq!(d.category, Category::Pipx, "{rel}");
+            assert_eq!(d.project, None, "{rel}");
+        }
     }
 
     #[test]
@@ -469,15 +523,31 @@ mod tests {
 
     #[test]
     fn skippable_covers_system_dirs_and_git() {
-        assert!(is_skippable(Path::new("/proc")));
-        assert!(is_skippable(Path::new("/sys")));
+        for dir in SYSTEM_DIRS {
+            assert!(is_skippable(Path::new(dir)), "{dir}");
+            // Only the directory itself: a root named below one is still walked.
+            assert!(!is_skippable(&Path::new(dir).join("work")), "{dir}/work");
+        }
         assert!(is_skippable(Path::new("/dev")));
-        assert!(is_skippable(Path::new("/run")));
-        assert!(is_skippable(Path::new("/tmp")));
         assert!(is_skippable(Path::new("/home/u/repo/.git")));
 
         assert!(!is_skippable(Path::new("/home/u/proc")));
-        assert!(!is_skippable(Path::new("/tmp/work")));
         assert!(!is_skippable(Path::new("/home/u/repo/.github")));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn skippable_covers_linux_pseudo_filesystems() {
+        for dir in ["/proc", "/sys", "/run", "/tmp"] {
+            assert!(is_skippable(Path::new(dir)), "{dir}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn skippable_covers_the_system_volume_and_temp_dirs() {
+        assert!(is_skippable(Path::new("/System")));
+        assert!(is_skippable(Path::new("/private/var/folders")));
+        assert!(!is_skippable(Path::new("/Users")));
     }
 }
