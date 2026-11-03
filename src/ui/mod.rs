@@ -40,16 +40,16 @@ const EVENT_BUDGET: usize = 4096;
 /// line with no wrapping, so a longer string loses its qualifier mid-sentence
 /// and reads as a promise. The full version lives in the help overlay.
 const BTRFS_NOTE: &str =
-    "reclaim = freed by deleting this alone · on btrfs/zfs the real gain differs";
+    "reclaim = freed by deleting this alone · on btrfs/zfs/apfs the real gain differs";
 
 /// The unabridged form of [`BTRFS_NOTE`], shown in the help overlay where
 /// there is room to wrap it.
 const RECLAIM_HELP: [&str; 2] = [
     "reclaim is the bytes freed by deleting that artifact alone: inodes whose every hardlink \
      lives inside it. Bytes it shares with something else are listed separately and survive.",
-    "On btrfs/zfs the space the filesystem hands back can still differ: compression, snapshots \
-     and reflinked copies (cp --reflink, the default of cp on btrfs) all share extents that \
-     st_blocks reports in full for each copy.",
+    "On btrfs/zfs/APFS the space the filesystem hands back can still differ: compression, \
+     snapshots and reflinked copies (cp --reflink, the default of cp on btrfs; cp -c and \
+     Finder's Duplicate on APFS) all share extents that st_blocks reports in full for each copy.",
 ];
 
 /// Restore the terminal to a sane state. Safe to call more than once.

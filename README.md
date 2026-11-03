@@ -40,12 +40,17 @@ script hands the binary `/dev/tty` instead. Headless invocations (`--no-tui`,
 `--json`, `--dry-run`, `--help`, `--version`) skip that requirement and stay
 pipeable in CI.
 
-Prebuilt binaries are static musl builds for `x86_64` and `aarch64` Linux. On
-any other platform, build from source.
+Prebuilt binaries cover `x86_64` and `aarch64` on Linux (static musl builds)
+and macOS. On Apple silicon the native binary is picked even from a shell
+running under Rosetta. On any other platform, build from source.
+
+The macOS binaries are ad-hoc signed, not notarized. `curl` does not mark what
+it downloads as quarantined, so Gatekeeper does not stop them under `run.sh`; a
+copy fetched with a browser needs `xattr -d com.apple.quarantine` first.
 
 ## Install
 
-Requires a recent Rust toolchain (edition 2024) and Linux.
+Requires a recent Rust toolchain (edition 2024) and Linux or macOS.
 
 ```sh
 git clone https://github.com/Party4Bread/venvpruner
@@ -156,7 +161,12 @@ authoritative reference.
 
 ## Notes
 
-- Linux only. Sizing uses `st_dev`/`st_ino`/`st_nlink`/`st_blocks`.
+- Linux and macOS. Sizing uses `st_dev`/`st_ino`/`st_nlink`/`st_blocks`.
+- On macOS the walk skips `/System`, which holds the sealed system volume and,
+  under `/System/Volumes/Data`, a second view of every file on the data volume.
+  Scanning folders such as `~/Documents` or `~/Desktop` triggers the usual
+  privacy prompt for your terminal; whatever it is refused shows up as a scan
+  error rather than as a missing artifact.
 - Symlinks are never followed, anywhere — not during the walk, not during
   sizing, not during deletion.
 - The walk stays on one filesystem by default, so network mounts and external
@@ -176,8 +186,10 @@ authoritative reference.
   is one `pnpm dlx` run out of dozens and `~/.cache/node/corepack/…/node_modules`
   one downloaded pnpm out of a dozen more — the directory worth acting on is
   `~/.cache/pnpm` or `~/.cache/node`. `XDG_CACHE_HOME` is honoured when set to
-  an absolute path. Naming a root inside a cache
-  (`venvpruner ~/.cache/node/corepack`) still lists what is in there.
+  an absolute path. On macOS `~/Library/Caches` is a second cache home and
+  collapses the same way, since pip, poetry, pdm and pnpm keep their caches
+  there while uv and huggingface stay in `~/.cache`. Naming a root inside a
+  cache (`venvpruner ~/.cache/node/corepack`) still lists what is in there.
 
 ## Development
 

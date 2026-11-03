@@ -277,7 +277,7 @@ fn visit<'scope>(
     scope: &rayon::Scope<'scope>,
     cfg: &ScanConfig,
     deferred: &Deferred,
-    cache_home: Option<&Path>,
+    cache_homes: &[PathBuf],
     path: &Path,
 ) -> WalkState {
     let Some(found) = detect::detect(path) else {
@@ -291,7 +291,9 @@ fn visit<'scope>(
     //
     // A cache directory above every scanned root is one the user did not ask
     // about; naming a directory must never make the tool report a path above it.
-    let cache = cache_home.and_then(|home| detect::cache_bucket(home, path));
+    let cache = cache_homes
+        .iter()
+        .find_map(|home| detect::cache_bucket(home, path));
     let was_scanned = |c: &PathBuf| cfg.roots.iter().any(|root| c.starts_with(root));
     if let Some(cache) = cache.filter(was_scanned) {
         deferred.add_cache(cache);
@@ -337,7 +339,7 @@ fn walk<'scope>(
     if cfg.roots.is_empty() || ctx.stopped() {
         return;
     }
-    let cache_home = detect::cache_home();
+    let cache_homes = Arc::new(detect::cache_homes());
 
     let mut builder = WalkBuilder::new(&cfg.roots[0]);
     for root in &cfg.roots[1..] {
@@ -361,7 +363,7 @@ fn walk<'scope>(
         let ctx = Arc::clone(ctx);
         let skip = Arc::clone(skip);
         let deferred = Arc::clone(deferred);
-        let cache_home = cache_home.clone();
+        let cache_homes = Arc::clone(&cache_homes);
         Box::new(move |result| {
             if ctx.stopped() {
                 return WalkState::Quit;
@@ -382,7 +384,7 @@ fn walk<'scope>(
             if skip.contains(path) || detect::is_skippable(path) {
                 return WalkState::Skip;
             }
-            visit(&ctx, scope, cfg, &deferred, cache_home.as_deref(), path)
+            visit(&ctx, scope, cfg, &deferred, &cache_homes, path)
         })
     });
 }

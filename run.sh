@@ -49,12 +49,21 @@ trap 'cleanup; exit 129' HUP
 # --- platform -----------------------------------------------------------------
 
 os=$(uname -s)
-[ "$os" = Linux ] || die "only Linux is supported (detected $os); build from source instead"
+case "$os" in
+    Linux) suffix=unknown-linux-musl ;;
+    Darwin) suffix=apple-darwin ;;
+    *) die "no prebuilt binary for $os; build from source with 'cargo build --release'" ;;
+esac
 
 arch=$(uname -m)
+# A shell running under Rosetta reports x86_64 on Apple silicon. The native
+# binary is the one to run there, and the kernel still tells the truth.
+if [ "$os" = Darwin ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ]; then
+    arch=arm64
+fi
 case "$arch" in
-    x86_64 | amd64) target=x86_64-unknown-linux-musl ;;
-    aarch64 | arm64) target=aarch64-unknown-linux-musl ;;
+    x86_64 | amd64) target=x86_64-$suffix ;;
+    aarch64 | arm64) target=aarch64-$suffix ;;
     *) die "no prebuilt binary for $arch; build from source with 'cargo build --release'" ;;
 esac
 

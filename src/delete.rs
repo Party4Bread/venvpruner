@@ -120,7 +120,7 @@ fn check_guard_inner(
 }
 
 /// `$HOME` itself, its ancestors, and its direct children are off limits — the
-/// direct children being the XDG-ish top levels (`~/.cache`, `~/.local`,
+/// direct children being the XDG-ish top levels (`~/.cache`, `~/.local`, `~/Library`,
 /// `~/Documents`). Known cache roots stay deletable; they are the whole point.
 fn check_home_rules(
     real: &Path,
