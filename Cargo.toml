@@ -21,6 +21,13 @@ rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# mio watches the terminal through kqueue, which on macOS rejects `/dev/tty`:
+# under `curl ... | sh` run.sh hands the binary exactly that as stdin, and the
+# TUI died with "Failed to initialize input reader". This feature waits on it
+# without mio instead.
+[target.'cfg(target_os = "macos")'.dependencies]
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
+
 [dev-dependencies]
 tempfile = "3"
 
